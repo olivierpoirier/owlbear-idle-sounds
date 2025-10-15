@@ -12,7 +12,7 @@ const volumeEl = document.getElementById("volume");
 
 // --- CHAOS settings ---
 const CHAOS_INTERVAL_MS = 200;
-const MAX_CHANNELS_HARD_CAP = 128; // monte si tu veux
+const MAX_CHANNELS_HARD_CAP = 128;
 
 // --- State ---
 let armed = false;
@@ -23,7 +23,8 @@ let audioCtx = null;                // AudioContext
 let gainNode = null;                // volume master
 let buffers = new Map();            // url -> AudioBuffer (pré-décodé)
 let activeSources = new Set();      // BufferSource actifs
-let lastIndex = -1;
+let lastIndex = -1;                 // anti-répétition immédiate
+let lastReady = null;               // null | true | false (dernier état de scène)
 
 // --- Utils ---
 function log(msg) {
@@ -69,15 +70,14 @@ async function ensureAudioContextUnlocked() {
     gainNode.connect(audioCtx.destination);
   }
   if (audioCtx.state !== "running") {
-    await audioCtx.resume(); // DOIT être appelé suite à un geste utilisateur
+    await audioCtx.resume(); // doit être appelé après un geste utilisateur
   }
-  // Jouer 20 ms de silence pour “chauffer” certains navigateurs/iOS
-  const t = audioCtx.currentTime;
+  // ping de silence ultra court (certains navigateurs)
   const silence = audioCtx.createBuffer(1, 128, audioCtx.sampleRate);
   const src = audioCtx.createBufferSource();
   src.buffer = silence;
   src.connect(gainNode);
-  src.start(t);
+  src.start();
 }
 
 async function fetchAndDecode(url) {
@@ -102,18 +102,18 @@ function playBuffer(buf) {
   src.buffer = buf;
   src.connect(gainNode);
   src.onended = () => activeSources.delete(src);
-  src.start(); // start NOW
+  src.start(); // now
   activeSources.add(src);
 }
 
 async function chaosTick() {
   if (!armed || !files.length) return;
 
-  // Hard cap pour éviter de plomber le navigateur
+  // hard cap
   if (activeSources.size >= MAX_CHANNELS_HARD_CAP) {
-    // purge douce des sources terminées
     for (const s of [...activeSources]) {
-      if (!s.buffer || s.playbackState === s.FINISHED_STATE) activeSources.delete(s);
+      // on trust onended pour purger; ici juste un garde-fou
+      if (!s.buffer) activeSources.delete(s);
     }
     if (activeSources.size >= MAX_CHANNELS_HARD_CAP) return;
   }
@@ -123,12 +123,12 @@ async function chaosTick() {
   const url = files[idx];
 
   try {
-    await ensureAudioContextUnlocked();         // garanti “user-gesture” OK
+    await ensureAudioContextUnlocked();
     const buf = buffers.get(url) || await fetchAndDecode(url);
     playBuffer(buf);
     log(`🎯 CHAOS: ${url} (actifs: ${activeSources.size})`);
   } catch (err) {
-    log("Échec lecture/decode (autoplay ou fichier ?) Voir console.");
+    log("Échec lecture/decode (autoplay ou fichier ?). Voir console.");
     console.error(err);
   }
 }
@@ -137,9 +137,7 @@ function startChaos() {
   stopChaos();
   if (!armed) { log("En attente d’autorisation audio…"); return; }
   if (!files.length) { log("Aucun fichier audio listé."); return; }
-
-  // tir immédiat + rafale toutes 200 ms
-  chaosTick();
+  chaosTick(); // tir immédiat
   chaosInterval = setInterval(chaosTick, CHAOS_INTERVAL_MS);
   log(`😈 CHAOS ON — tir toutes ${CHAOS_INTERVAL_MS}ms`);
 }
@@ -158,7 +156,6 @@ function stopAll() {
     activeSources.delete(s);
   }
   log("🛑 Tous les sons arrêtés.");
-  // Optionnel : suspend le contexte pour économiser
   if (audioCtx && audioCtx.state === "running") {
     audioCtx.suspend().catch(() => {});
   }
@@ -167,10 +164,27 @@ function stopAll() {
 // --- UI ---
 btnArm?.addEventListener("click", async () => {
   try {
-    await ensureAudioContextUnlocked(); // geste utilisateur → OK
+    await ensureAudioContextUnlocked();
     armed = true;
     if (btnArm) btnArm.disabled = true;
     log("Autorisations audio acquises (AudioContext running).");
+
+    // 🔥 DÉMARRAGE IMMÉDIAT si aucune scène au moment du clic
+    if (lastReady === false) {
+      startChaos();
+    } else if (lastReady === true) {
+      stopAll();
+    } else {
+      // si on n'a pas encore la valeur, on la lit maintenant
+      if (OBR.isAvailable) {
+        const r = await OBR.scene.isReady();
+        lastReady = r;
+        if (!r) startChaos(); else stopAll();
+      } else {
+        // hors OBR → part direct
+        startChaos();
+      }
+    }
   } catch (e) {
     log("Impossible d’activer l’audio (gesture?). Réessaie.");
     console.error(e);
@@ -199,15 +213,14 @@ volumeEl?.addEventListener("input", () => {
 
 // --- OBR integration ---
 async function updateReadyUI(ready) {
+  lastReady = ready; // ✅ mémorise l'état courant
   statusEl.textContent = ready ? "🎬 scène ouverte" : "🔇 aucune scène";
   statusEl.style.color = ready ? "#93c5fd" : "#a7f3d0";
 
   if (ready) {
-    // scène ouverte → coupe tout immédiatement
-    stopAll();
+    stopAll();      // scène ouverte → silence
   } else {
-    // aucune scène → chaos instantané
-    startChaos();
+    startChaos();   // aucune scène → CHAOS (si déjà armé, sinon démarrera au clic)
   }
 }
 
