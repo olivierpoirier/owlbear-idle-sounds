@@ -1,30 +1,53 @@
 import OBR from "@owlbear-rodeo/sdk";
 
+// === Storage helpers ===
+const LS_KEYS = {
+  volume: "idleSounds.volume",
+  interval: "idleSounds.intervalMs",
+  shout: "idleSounds.shoutOver",
+};
+const store = {
+  get(key, fallback) {
+    try {
+      const v = localStorage.getItem(key);
+      if (v === null) return fallback;
+      if (v === "true" || v === "false") return v === "true";
+      const num = Number(v);
+      return Number.isFinite(num) && String(num) === v ? num : v;
+    } catch { return fallback; }
+  },
+  set(key, val) {
+    try { localStorage.setItem(key, String(val)); } catch {}
+  }
+};
+
 // --- UI refs ---
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 const fileListEl = document.getElementById("fileList");
-
 const btnArm = document.getElementById("btn-arm");
 const btnPreload = document.getElementById("btn-preload");
 const btnTest = document.getElementById("btn-test");
 const volumeEl = document.getElementById("volume");
+const intervalEl = document.getElementById("interval");
+const shoutOverEl = document.getElementById("shoutOver");
 
-// --- CHAOS settings ---
-const CHAOS_INTERVAL_MS = 200;
+// --- CHAOS defaults ---
+let CHAOS_INTERVAL_MS = 200;
 const MAX_CHANNELS_HARD_CAP = 128;
 
 // --- State ---
 let armed = false;
 let chaosInterval = null;
 
-let files = [];                     // ['/sounds/monkey1.mp3', ...]
-let audioCtx = null;                // AudioContext
-let gainNode = null;                // volume master
-let buffers = new Map();            // url -> AudioBuffer (pré-décodé)
+let baseFiles = [];                 // depuis sounds.json
+let files = [];                     // baseFiles + shout option
+let audioCtx = null;
+let gainNode = null;
+let buffers = new Map();            // url -> AudioBuffer
 let activeSources = new Set();      // BufferSource actifs
-let lastIndex = -1;                 // anti-répétition immédiate
-let lastReady = null;               // null | true | false (dernier état de scène)
+let lastIndex = -1;
+let lastReady = null;
 
 // --- Utils ---
 function log(msg) {
@@ -33,18 +56,32 @@ function log(msg) {
   console.debug("[IdleSounds-CHAOS]", msg);
 }
 
+function refreshDetectedList() {
+  fileListEl.innerHTML = "";
+  files.forEach((f) => {
+    const li = document.createElement("li");
+    li.textContent = f;
+    fileListEl.appendChild(li);
+  });
+}
+
+function applyOptionsToFiles() {
+  files = [...baseFiles];
+  if (shoutOverEl.checked) {
+    // injecte le cri par dessus les singes
+    const shout = "/sounds/ta_gueule_le_singe.mp3";
+    if (!files.includes(shout)) files.push(shout);
+  }
+  refreshDetectedList();
+}
+
 async function loadList() {
   try {
     const res = await fetch("/sounds/sounds.json", { cache: "no-store" });
     const data = await res.json();
-    files = Array.isArray(data.files) ? data.files : [];
-    fileListEl.innerHTML = "";
-    files.forEach((f) => {
-      const li = document.createElement("li");
-      li.textContent = f;
-      fileListEl.appendChild(li);
-    });
-    log(`Chargé ${files.length} fichier(s) audio.`);
+    baseFiles = Array.isArray(data.files) ? data.files : [];
+    applyOptionsToFiles();
+    log(`Chargé ${baseFiles.length} fichier(s) audio (base).`);
   } catch (e) {
     log("Erreur de chargement de /sounds/sounds.json");
     console.error(e);
@@ -61,7 +98,7 @@ function pickNextIndex() {
   return idx;
 }
 
-// --- Web Audio helpers ---
+// --- Web Audio ---
 async function ensureAudioContextUnlocked() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -70,9 +107,8 @@ async function ensureAudioContextUnlocked() {
     gainNode.connect(audioCtx.destination);
   }
   if (audioCtx.state !== "running") {
-    await audioCtx.resume(); // doit être appelé après un geste utilisateur
+    await audioCtx.resume();
   }
-  // ping de silence ultra court (certains navigateurs)
   const silence = audioCtx.createBuffer(1, 128, audioCtx.sampleRate);
   const src = audioCtx.createBufferSource();
   src.buffer = silence;
@@ -83,6 +119,7 @@ async function ensureAudioContextUnlocked() {
 async function fetchAndDecode(url) {
   if (buffers.has(url)) return buffers.get(url);
   const resp = await fetch(url, { cache: "force-cache" });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
   const arr = await resp.arrayBuffer();
   const buf = await audioCtx.decodeAudioData(arr);
   buffers.set(url, buf);
@@ -92,8 +129,8 @@ async function fetchAndDecode(url) {
 async function preloadAll() {
   if (!files.length) return log("Aucun fichier audio listé.");
   await ensureAudioContextUnlocked();
-  await Promise.all(files.map(fetchAndDecode));
-  log(`Préchargement terminé (${buffers.size} buffers).`);
+  await Promise.all(files.map(fetchAndDecode).map(p => p.catch(e => log(`Précharge ignoré: ${e.message}`))));
+  log(`Préchargement terminé (${[...buffers.keys()].length} buffers).`);
 }
 
 function playBuffer(buf) {
@@ -102,17 +139,16 @@ function playBuffer(buf) {
   src.buffer = buf;
   src.connect(gainNode);
   src.onended = () => activeSources.delete(src);
-  src.start(); // now
+  src.start();
   activeSources.add(src);
 }
 
 async function chaosTick() {
   if (!armed || !files.length) return;
 
-  // hard cap
   if (activeSources.size >= MAX_CHANNELS_HARD_CAP) {
     for (const s of [...activeSources]) {
-      // on trust onended pour purger; ici juste un garde-fou
+      // laisse onended faire le ménage ; ici, simple soupape
       if (!s.buffer) activeSources.delete(s);
     }
     if (activeSources.size >= MAX_CHANNELS_HARD_CAP) return;
@@ -126,9 +162,8 @@ async function chaosTick() {
     await ensureAudioContextUnlocked();
     const buf = buffers.get(url) || await fetchAndDecode(url);
     playBuffer(buf);
-    log(`🎯 CHAOS: ${url} (actifs: ${activeSources.size})`);
   } catch (err) {
-    log("Échec lecture/decode (autoplay ou fichier ?). Voir console.");
+    log(`Échec lecture: ${url} — ${err.message}`);
     console.error(err);
   }
 }
@@ -161,27 +196,48 @@ function stopAll() {
   }
 }
 
-// --- UI ---
+// --- UI events + persistence ---
+function loadPrefs() {
+  // Volume
+  const vol = store.get(LS_KEYS.volume, 0.8);
+  volumeEl.value = String(vol);
+  // Intervalle
+  const itv = store.get(LS_KEYS.interval, 200);
+  intervalEl.value = String(itv);
+  CHAOS_INTERVAL_MS = Math.max(20, Number(itv) || 200);
+  // Shout
+  const sh = store.get(LS_KEYS.shout, false);
+  shoutOverEl.checked = !!sh;
+}
+
+function persistAndApplyInterval() {
+  const itv = Math.max(20, Number(intervalEl.value) || 200);
+  CHAOS_INTERVAL_MS = itv;
+  store.set(LS_KEYS.interval, itv);
+  if (chaosInterval) {
+    // redémarre l’intervalle avec la nouvelle cadence
+    startChaos();
+  }
+  log(`Intervalle mis à ${itv}ms`);
+}
+
 btnArm?.addEventListener("click", async () => {
   try {
     await ensureAudioContextUnlocked();
     armed = true;
-    if (btnArm) btnArm.disabled = true;
+    btnArm.disabled = true;
     log("Autorisations audio acquises (AudioContext running).");
 
-    // 🔥 DÉMARRAGE IMMÉDIAT si aucune scène au moment du clic
     if (lastReady === false) {
       startChaos();
     } else if (lastReady === true) {
       stopAll();
     } else {
-      // si on n'a pas encore la valeur, on la lit maintenant
       if (OBR.isAvailable) {
         const r = await OBR.scene.isReady();
         lastReady = r;
         if (!r) startChaos(); else stopAll();
       } else {
-        // hors OBR → part direct
         startChaos();
       }
     }
@@ -192,6 +248,7 @@ btnArm?.addEventListener("click", async () => {
 });
 
 btnPreload?.addEventListener("click", preloadAll);
+
 btnTest?.addEventListener("click", async () => {
   if (!files.length) return;
   const url = files[Math.floor(Math.random() * files.length)];
@@ -209,22 +266,33 @@ btnTest?.addEventListener("click", async () => {
 volumeEl?.addEventListener("input", () => {
   const v = Number(volumeEl.value);
   if (gainNode) gainNode.gain.value = v;
+  store.set(LS_KEYS.volume, v);
+});
+
+intervalEl?.addEventListener("change", persistAndApplyInterval);
+intervalEl?.addEventListener("input", () => {
+  // feedback instantané optionnel (ne persiste pas à chaque keypress)
+});
+
+shoutOverEl?.addEventListener("change", async () => {
+  store.set(LS_KEYS.shout, shoutOverEl.checked);
+  applyOptionsToFiles();
+  // si on avait préchargé, on peut tenter de précharger le nouveau fichier
+  if (shoutOverEl.checked && audioCtx) {
+    try { await fetchAndDecode("/sounds/ta_gueule_le_singe.mp3"); } catch {}
+  }
 });
 
 // --- OBR integration ---
 async function updateReadyUI(ready) {
-  lastReady = ready; // ✅ mémorise l'état courant
+  lastReady = ready;
   statusEl.textContent = ready ? "🎬 scène ouverte" : "🔇 aucune scène";
   statusEl.style.color = ready ? "#93c5fd" : "#a7f3d0";
-
-  if (ready) {
-    stopAll();      // scène ouverte → silence
-  } else {
-    startChaos();   // aucune scène → CHAOS (si déjà armé, sinon démarrera au clic)
-  }
+  if (ready) stopAll(); else startChaos();
 }
 
 async function init() {
+  loadPrefs();
   await loadList();
 
   const inOBR = OBR.isAvailable;
@@ -237,7 +305,6 @@ async function init() {
   OBR.onReady(async () => {
     const ready = await OBR.scene.isReady();
     await updateReadyUI(ready);
-
     const unsub = OBR.scene.onReadyChange(async (isReady) => {
       await updateReadyUI(isReady);
     });
