@@ -1,6 +1,6 @@
 import OBR from "@owlbear-rodeo/sdk";
 
-// --- Références UI existantes ---
+// --- UI refs ---
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 const fileListEl = document.getElementById("fileList");
@@ -10,18 +10,20 @@ const btnPreload = document.getElementById("btn-preload");
 const btnTest = document.getElementById("btn-test");
 const volumeEl = document.getElementById("volume");
 
-// --- Réglages CHAOS ---
-const CHAOS_ENABLED = true;          // on force le chaos
-const CHAOS_INTERVAL_MS = 200;       // un tir toutes les 200ms
-const MAX_CHANNELS_HARD_CAP = 64;    // sécurité pour éviter le crash navigateur (augmente si tu veux VRAIMENT le chaos)
+// --- CHAOS settings ---
+const CHAOS_INTERVAL_MS = 200;
+const MAX_CHANNELS_HARD_CAP = 128; // monte si tu veux
 
-// --- État ---
-let armed = false;                   // l’utilisateur a cliqué pour autoriser l’audio
-let files = [];                      // liste depuis /sounds/sounds.json
-let audioPool = [];                  // préchargement optionnel
-let chaosInterval = null;            // setInterval id
-const activeAudios = new Set();      // instances Audio concurrentes
-let lastIndex = -1;                  // pour éviter une répétition immédiate en "shuffle" basique
+// --- State ---
+let armed = false;
+let chaosInterval = null;
+
+let files = [];                     // ['/sounds/monkey1.mp3', ...]
+let audioCtx = null;                // AudioContext
+let gainNode = null;                // volume master
+let buffers = new Map();            // url -> AudioBuffer (pré-décodé)
+let activeSources = new Set();      // BufferSource actifs
+let lastIndex = -1;
 
 // --- Utils ---
 function log(msg) {
@@ -50,7 +52,6 @@ async function loadList() {
 
 function pickNextIndex() {
   if (files.length === 0) return -1;
-  // mini-shuffle: évite seulement la répétition immédiate
   let idx = Math.floor(Math.random() * files.length);
   if (files.length > 1) {
     while (idx === lastIndex) idx = Math.floor(Math.random() * files.length);
@@ -59,59 +60,85 @@ function pickNextIndex() {
   return idx;
 }
 
-function createAudio(url) {
-  const a = new Audio(url);
-  a.preload = "auto";
-  a.crossOrigin = "anonymous";
-  a.volume = Number(volumeEl?.value ?? 0.8);
-  return a;
+// --- Web Audio helpers ---
+async function ensureAudioContextUnlocked() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = Number(volumeEl?.value ?? 0.8);
+    gainNode.connect(audioCtx.destination);
+  }
+  if (audioCtx.state !== "running") {
+    await audioCtx.resume(); // DOIT être appelé suite à un geste utilisateur
+  }
+  // Jouer 20 ms de silence pour “chauffer” certains navigateurs/iOS
+  const t = audioCtx.currentTime;
+  const silence = audioCtx.createBuffer(1, 128, audioCtx.sampleRate);
+  const src = audioCtx.createBufferSource();
+  src.buffer = silence;
+  src.connect(gainNode);
+  src.start(t);
+}
+
+async function fetchAndDecode(url) {
+  if (buffers.has(url)) return buffers.get(url);
+  const resp = await fetch(url, { cache: "force-cache" });
+  const arr = await resp.arrayBuffer();
+  const buf = await audioCtx.decodeAudioData(arr);
+  buffers.set(url, buf);
+  return buf;
 }
 
 async function preloadAll() {
-  audioPool = files.map(createAudio);
-  audioPool.forEach(a => a.load());
-  log(`Préchargement lancé (${audioPool.length})`);
+  if (!files.length) return log("Aucun fichier audio listé.");
+  await ensureAudioContextUnlocked();
+  await Promise.all(files.map(fetchAndDecode));
+  log(`Préchargement terminé (${buffers.size} buffers).`);
 }
 
-// --- Cœur: tir CHAOS (polyphonie overlapping, toutes 200ms) ---
-async function chaosTick() {
-  if (!armed || files.length === 0) return;
+function playBuffer(buf) {
+  if (!audioCtx || !buf) return;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(gainNode);
+  src.onended = () => activeSources.delete(src);
+  src.start(); // start NOW
+  activeSources.add(src);
+}
 
-  // Hard cap de sécurité
-  if (activeAudios.size >= MAX_CHANNELS_HARD_CAP) {
-    // on nettoie les canaux terminés (au cas où)
-    for (const a of [...activeAudios]) {
-      if (a.ended || a.paused) activeAudios.delete(a);
+async function chaosTick() {
+  if (!armed || !files.length) return;
+
+  // Hard cap pour éviter de plomber le navigateur
+  if (activeSources.size >= MAX_CHANNELS_HARD_CAP) {
+    // purge douce des sources terminées
+    for (const s of [...activeSources]) {
+      if (!s.buffer || s.playbackState === s.FINISHED_STATE) activeSources.delete(s);
     }
-    if (activeAudios.size >= MAX_CHANNELS_HARD_CAP) return; // toujours trop plein
+    if (activeSources.size >= MAX_CHANNELS_HARD_CAP) return;
   }
 
   const idx = pickNextIndex();
   if (idx < 0) return;
-
   const url = files[idx];
-  // Ne pas réutiliser un même élément si on veut l’overlap immédiat → nouvelle instance:
-  const audio = createAudio(url);
-  activeAudios.add(audio);
-
-  audio.onended = () => activeAudios.delete(audio);
-  audio.onerror = () => activeAudios.delete(audio);
 
   try {
-    await audio.play(); // si autoplay non armé, ça throw → l’utilisateur doit cliquer "Activer l’audio"
-    log(`🎯 CHAOS: ${url} (actifs: ${activeAudios.size})`);
+    await ensureAudioContextUnlocked();         // garanti “user-gesture” OK
+    const buf = buffers.get(url) || await fetchAndDecode(url);
+    playBuffer(buf);
+    log(`🎯 CHAOS: ${url} (actifs: ${activeSources.size})`);
   } catch (err) {
-    activeAudios.delete(audio);
-    log("Lecture bloquée (autoplay ?). Clique sur “Activer l’audio”.");
+    log("Échec lecture/decode (autoplay ou fichier ?) Voir console.");
+    console.error(err);
   }
 }
 
 function startChaos() {
-  stopChaos(); // reset par sécurité
+  stopChaos();
   if (!armed) { log("En attente d’autorisation audio…"); return; }
   if (!files.length) { log("Aucun fichier audio listé."); return; }
 
-  // Tir immédiat, puis rafales toutes 200ms
+  // tir immédiat + rafale toutes 200 ms
   chaosTick();
   chaosInterval = setInterval(chaosTick, CHAOS_INTERVAL_MS);
   log(`😈 CHAOS ON — tir toutes ${CHAOS_INTERVAL_MS}ms`);
@@ -125,67 +152,72 @@ function stopChaos() {
 }
 
 function stopAll() {
-  // stop scheduling
   stopChaos();
-  // stoppe et vide toutes les instances
-  for (const a of [...activeAudios]) {
-    try { a.pause(); a.currentTime = 0; } catch {}
-    activeAudios.delete(a);
-  }
-  // au cas où des audios du pool joueraient
-  for (const a of [...audioPool]) {
-    try { a.pause(); a.currentTime = 0; } catch {}
+  for (const s of [...activeSources]) {
+    try { s.stop(0); } catch {}
+    activeSources.delete(s);
   }
   log("🛑 Tous les sons arrêtés.");
+  // Optionnel : suspend le contexte pour économiser
+  if (audioCtx && audioCtx.state === "running") {
+    audioCtx.suspend().catch(() => {});
+  }
 }
 
 // --- UI ---
 btnArm?.addEventListener("click", async () => {
-  armed = true;
-  if (btnArm) btnArm.disabled = true;
-  log("Autorisations audio acquises.");
-  // petit ping silencieux pour "chauffer" l'autoplay si possible
-  if (files.length) {
-    try {
-      const test = createAudio(files[0]);
-      await test.play();
-      test.pause();
-      test.currentTime = 0;
-    } catch {}
+  try {
+    await ensureAudioContextUnlocked(); // geste utilisateur → OK
+    armed = true;
+    if (btnArm) btnArm.disabled = true;
+    log("Autorisations audio acquises (AudioContext running).");
+  } catch (e) {
+    log("Impossible d’activer l’audio (gesture?). Réessaie.");
+    console.error(e);
   }
 });
 
 btnPreload?.addEventListener("click", preloadAll);
-btnTest?.addEventListener("click", chaosTick);
-volumeEl?.addEventListener("input", () => {
-  const v = Number(volumeEl.value);
-  // met à jour le volume des canaux actifs et du pool
-  activeAudios.forEach(a => a.volume = v);
-  audioPool.forEach(a => a.volume = v);
+btnTest?.addEventListener("click", async () => {
+  if (!files.length) return;
+  const url = files[Math.floor(Math.random() * files.length)];
+  try {
+    await ensureAudioContextUnlocked();
+    const buf = buffers.get(url) || await fetchAndDecode(url);
+    playBuffer(buf);
+    log(`▶ Test: ${url}`);
+  } catch (e) {
+    log("Test: échec lecture (voir console).");
+    console.error(e);
+  }
 });
 
-// --- Intégration OBR: quand PAS de scène => CHAOS; quand scène prête => SILENCE ---
+volumeEl?.addEventListener("input", () => {
+  const v = Number(volumeEl.value);
+  if (gainNode) gainNode.gain.value = v;
+});
+
+// --- OBR integration ---
 async function updateReadyUI(ready) {
   statusEl.textContent = ready ? "🎬 scène ouverte" : "🔇 aucune scène";
   statusEl.style.color = ready ? "#93c5fd" : "#a7f3d0";
 
   if (ready) {
-    // scène ouverte: on coupe le chaos immédiatement
+    // scène ouverte → coupe tout immédiatement
     stopAll();
   } else {
-    // aucune scène: on démarre le chaos instantanément
-    if (CHAOS_ENABLED) startChaos();
+    // aucune scène → chaos instantané
+    startChaos();
   }
 }
 
 async function init() {
   await loadList();
 
-  // Mode test hors Owlbear (ex: ouvrez index.html dans un onglet)
   const inOBR = OBR.isAvailable;
   if (!inOBR) {
     log("⚠ Extension ouverte hors Owlbear (mode test).");
-    await updateReadyUI(false); // démarre le chaos si armé
+    await updateReadyUI(false);
     return;
   }
 
