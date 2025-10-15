@@ -1,0 +1,17 @@
+{
+  "name": "owlbear-idle-sounds",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --host"
+  },
+  "dependencies": {
+    "@owlbear-rodeo/sdk": "^1.6.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.10"
+  }
+}

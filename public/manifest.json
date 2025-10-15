@@ -1,0 +1,15 @@
+{
+  "name": "Idle Sounds (No Scene)",
+  "version": "1.0.0",
+  "manifest_version": 1,
+  "description": "Joue des sons aléatoires quand aucune scène n'est active.",
+  "icon": "/icon.svg",
+  "action": {
+    "title": "Idle Sounds",
+    "icon": "/icon.svg",
+    "popover": "/",
+    "width": 360,
+    "height": 420
+  },
+  "homepage_url": "https://github.com/ton-user/owlbear-idle-sounds"
+}
