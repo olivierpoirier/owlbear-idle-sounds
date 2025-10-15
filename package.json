@@ -9,7 +9,7 @@
     "preview": "vite preview --host"
   },
   "dependencies": {
-    "@owlbear-rodeo/sdk": "^1.6.0"
+    "@owlbear-rodeo/sdk": "^3.1.0"
   },
   "devDependencies": {
     "vite": "^5.4.10"
