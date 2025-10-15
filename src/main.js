@@ -12,11 +12,13 @@ const minDelayEl = document.getElementById("minDelay");
 const maxDelayEl = document.getElementById("maxDelay");
 const modeEl = document.getElementById("mode");
 
-let armed = false;          // l’utilisateur a cliqué au moins une fois
-let currentTimer = null;    // timer entre les sons
-let audioPool = [];         // éléments HTMLAudio préchargés
-let files = [];             // URLs lues depuis /sounds/sounds.json
-let lastIndex = -1;         // pour éviter la répétition immédiate en shuffle
+let armed = false;          // interaction utilisateur autorisant l'audio
+let currentTimer = null;    // timer entre deux sons
+let audioPool = [];         // audios préchargés
+let files = [];             // chemins depuis /sounds/sounds.json
+let lastIndex = -1;         // anti-répétition immédiate en shuffle
+let lastPlayAt = 0;         // anti-double tir sur transition
+const INSTANT_ON = true;    // 🔥 joue immédiatement quand aucune scène
 
 function log(msg) {
   const ts = new Date().toLocaleTimeString();
@@ -43,9 +45,9 @@ async function loadList() {
 }
 
 function getRandomInt(min, max) {
-  // bornes inclusives en secondes → ms
   const sMin = Math.max(0, Number(min) || 0);
   const sMax = Math.max(sMin, Number(max) || sMin);
+  // valeur en ms (bornes inclusives)
   return (sMin * 1000) + Math.floor(Math.random() * ((sMax - sMin + 1) * 1000));
 }
 
@@ -54,7 +56,7 @@ function pickNextIndex() {
   if (modeEl.value === "random") {
     return Math.floor(Math.random() * files.length);
   }
-  // shuffle simple : parcours sans répéter immédiat
+  // shuffle (évite répétition immédiate)
   let idx = Math.floor(Math.random() * files.length);
   if (files.length > 1) {
     while (idx === lastIndex) idx = Math.floor(Math.random() * files.length);
@@ -73,17 +75,8 @@ function createAudio(url) {
 
 async function preloadAll() {
   audioPool = files.map(createAudio);
-  // Fire le téléchargement
   audioPool.forEach(a => a.load());
   log(`Préchargement lancé (${audioPool.length})`);
-}
-
-function scheduleNext() {
-  clearTimer();
-  if (!armed) { log("En attente d’autorisation audio…"); return; }
-  const delay = getRandomInt(minDelayEl.value, maxDelayEl.value);
-  log(`Prochain son dans ~${Math.round(delay/1000)}s`);
-  currentTimer = setTimeout(playOne, delay);
 }
 
 function clearTimer() {
@@ -93,37 +86,49 @@ function clearTimer() {
   }
 }
 
+function scheduleNext() {
+  clearTimer();
+  if (!armed) { log("En attente d’autorisation audio…"); return; }
+  if (!files.length) { log("Aucun fichier audio listé."); return; }
+  const delay = getRandomInt(minDelayEl.value, maxDelayEl.value);
+  log(`Prochain son dans ~${Math.round(delay / 1000)}s`);
+  currentTimer = setTimeout(playOne, delay);
+}
+
 async function playOne() {
   if (!armed || files.length === 0) return;
+
   const idx = pickNextIndex();
   if (idx < 0) return;
 
   const url = files[idx];
-  let audio = audioPool.find(a => a.src.includes(url)) || createAudio(url);
+
+  // Essayons de retrouver un audio préchargé (compare par fin de src pour éviter les URLs absolues)
+  let audio = audioPool.find(a => a.src.endsWith(url)) || createAudio(url);
   audio.volume = Number(volumeEl.value);
 
   try {
     await audio.play();
+    lastPlayAt = Date.now();
     log(`Lecture: ${url}`);
     audio.onended = () => scheduleNext();
   } catch (err) {
-    log("Lecture bloquée (autoplay?). Clique sur “Activer l’audio”.");
+    log("Lecture bloquée (autoplay ?). Clique sur “Activer l’audio”.");
     console.warn(err);
   }
 }
 
 function stopAll() {
   clearTimer();
-  // stoppe toute lecture en cours
   [...audioPool].forEach(a => { try { a.pause(); a.currentTime = 0; } catch {} });
 }
 
-// --- Gestion UI ---
+// --- UI ---
 btnArm.addEventListener("click", async () => {
   armed = true;
   btnArm.disabled = true;
   log("Autorisations audio acquises.");
-  // petit son test si dispo
+  // petit ping silencieux pour lever l'autoplay si possible
   if (files.length) {
     try {
       const test = createAudio(files[0]);
@@ -144,11 +149,26 @@ volumeEl.addEventListener("input", () => {
 async function updateReadyUI(ready) {
   statusEl.textContent = ready ? "🎬 scène ouverte" : "🔇 aucune scène";
   statusEl.style.color = ready ? "#93c5fd" : "#a7f3d0";
+
   if (ready) {
+    // scène ouverte => silence
     log("Scène détectée → arrêt des sons.");
     stopAll();
   } else {
-    log("Aucune scène détectée → programmation des sons.");
+    // aucune scène => on joue tout de suite puis on planifie
+    log("Aucune scène détectée.");
+    if (INSTANT_ON && armed && files.length) {
+      // évite double tir si plusieurs événements "false" proches
+      if (Date.now() - lastPlayAt > 500) {
+        log("Instant-on: lecture immédiate.");
+        clearTimer();
+        // joue immédiatement (sans délai), puis onchain onended → scheduleNext()
+        playOne();
+        return; // on laisse onended enchaîner
+      }
+    }
+    // sinon, planifie selon min/max
+    log("Programmation selon le délai min/max.");
     scheduleNext();
   }
 }
@@ -156,7 +176,7 @@ async function updateReadyUI(ready) {
 async function init() {
   await loadList();
 
-  // Si l’extension n’est pas chargée DANS Owlbear, on autorise quand même les tests hors OBR
+  // Mode test hors Owlbear (ouvre l'appli dans un onglet normal)
   const inOBR = OBR.isAvailable;
   if (!inOBR) {
     log("⚠ Extension ouverte hors Owlbear (mode test).");
@@ -164,12 +184,10 @@ async function init() {
     return;
   }
 
-  // On attend le SDK prêt, puis on interroge l’état de la scène
   OBR.onReady(async () => {
-    const ready = await OBR.scene.isReady(); // true si une scène est ouverte et prête
+    const ready = await OBR.scene.isReady();
     await updateReadyUI(ready);
 
-    // Abonnement aux changements de l’état “ready” de la scène
     const unsub = OBR.scene.onReadyChange(async (isReady) => {
       await updateReadyUI(isReady);
     });
